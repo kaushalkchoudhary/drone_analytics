@@ -9,6 +9,7 @@ opencv = "0.98"
 jamtrack-rs = { git = "https://github.com/kadu-v/jamtrack-rs.git" }
 ultralytics-inference = { git = "https://github.com/ultralytics/inference.git" }
 chrono = "0.4"
+crossbeam-channel = "0.5"
 ndarray = "=0.17.2"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"

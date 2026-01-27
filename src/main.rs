@@ -2,6 +2,7 @@
 
 use anyhow::{anyhow, Result};
 use chrono::Local;
+use crossbeam_channel::{bounded, Receiver};
 use jamtrack_rs::byte_tracker::ByteTracker;
 use jamtrack_rs::{Object, Rect as JamRect};
 use ndarray::Array3;
@@ -10,7 +11,18 @@ use opencv::{
     highgui, imgproc, prelude::*, videoio,
 };
 use sysinfo::{get_current_pid, ProcessRefreshKind, ProcessesToUpdate, System};
-use std::{collections::{HashMap, HashSet}, env, fs, path::{Path, PathBuf}, str::FromStr};
+use std::{
+    collections::{HashMap, HashSet},
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command,
+    str::FromStr,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread::{self, JoinHandle},
+};
 use std::time::{Duration, Instant};
 use serde::Deserialize;
 use ultralytics_inference::{Device, InferenceConfig, YOLOModel};
@@ -31,6 +43,8 @@ enum OutputFormat {
     Mp4,
 }
 
+const DEFAULT_IO_BUFFER: usize = 120;
+
 #[derive(Debug)]
 struct CliOptions {
     source: Option<String>,
@@ -39,6 +53,7 @@ struct CliOptions {
     output: OutputFormat,
     device: Option<Device>,
     threads: Option<usize>,
+    io_buffer: usize,
 }
 
 fn parse_args() -> Result<CliOptions> {
@@ -49,6 +64,7 @@ fn parse_args() -> Result<CliOptions> {
         output: OutputFormat::Mkv,
         device: None,
         threads: None,
+        io_buffer: DEFAULT_IO_BUFFER,
     };
 
     let mut iter = env::args().skip(1).peekable();
@@ -69,6 +85,13 @@ fn parse_args() -> Result<CliOptions> {
                     .parse::<usize>()
                     .map_err(|_| anyhow!("--threads must be a non-negative integer"))?;
                 opts.threads = Some(parsed);
+            }
+            "--buffer" | "--io-buffer" => {
+                let buf = iter.next().ok_or_else(|| anyhow!("--buffer requires a value"))?;
+                let parsed = buf
+                    .parse::<usize>()
+                    .map_err(|_| anyhow!("--buffer must be a non-negative integer"))?;
+                opts.io_buffer = parsed.max(1);
             }
             "--device" => {
                 let device = iter.next().ok_or_else(|| anyhow!("--device requires a value"))?;
@@ -108,6 +131,62 @@ fn parse_args() -> Result<CliOptions> {
     Ok(opts)
 }
 
+struct CaptureWorker {
+    rx: Receiver<CapturedFrame>,
+    stop: Arc<AtomicBool>,
+    join: JoinHandle<Result<()>>,
+}
+
+impl CaptureWorker {
+    fn stop(self) -> Result<()> {
+        self.stop.store(true, Ordering::Relaxed);
+        match self.join.join() {
+            Ok(res) => res,
+            Err(_) => Err(anyhow!("Capture thread panicked")),
+        }
+    }
+}
+
+struct CapturedFrame {
+    frame: Mat,
+    idx: usize,
+}
+
+fn start_capture_thread(
+    mut cap: videoio::VideoCapture,
+    stride: usize,
+    buffer: usize,
+) -> CaptureWorker {
+    let (tx, rx) = bounded::<CapturedFrame>(buffer.max(1));
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = Arc::clone(&stop);
+    let join = thread::spawn(move || -> Result<()> {
+        let mut frame = Mat::default();
+        let mut idx = 0usize;
+        loop {
+            if stop_thread.load(Ordering::Relaxed) {
+                break;
+            }
+            if !cap.read(&mut frame)? {
+                break;
+            }
+            if idx % stride != 0 {
+                idx += 1;
+                continue;
+            }
+            let owned = frame.try_clone()?;
+            let packet = CapturedFrame { frame: owned, idx };
+            if tx.try_send(packet).is_err() {
+                // Drop newest frame when the buffer is full to avoid blocking I/O.
+            }
+            idx += 1;
+        }
+        Ok(())
+    });
+
+    CaptureWorker { rx, stop, join }
+}
+
 // full pipeline
 fn process_video() -> Result<()> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -117,7 +196,10 @@ fn process_video() -> Result<()> {
     let rtsp_config = data_dir.join("rtsp_links.yml");
 
     let rtsp_links = load_rtsp_links(&rtsp_config)?;
-    let opts = parse_args()?;
+    let mut opts = parse_args()?;
+    if opts.device.is_none() && cfg!(target_os = "macos") {
+        opts.device = Some(Device::Mps);
+    }
     let (mut sources, mut source_idx) = match opts.source {
         Some(arg) => {
             if is_rtsp_source(&arg) {
@@ -159,12 +241,14 @@ fn process_video() -> Result<()> {
         .with_confidence(CONF_THRESH)
         .with_iou(0.45)
         .with_max_det(500);
-    if let Some(threads) = opts.threads {
-        cfg = cfg.with_threads(threads);
-    }
-    if let Some(device) = opts.device {
+    let default_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    cfg = cfg.with_threads(opts.threads.unwrap_or(default_threads));
+    if let Some(device) = opts.device.clone() {
         cfg = cfg.with_device(device);
     }
+    let overlay_device = opts.device.clone().unwrap_or(Device::Cpu);
 
     let model_path = data_dir.join("yolov11n-visdrone.onnx");
     if !model_path.exists() {
@@ -174,8 +258,9 @@ fn process_video() -> Result<()> {
     let mut model = YOLOModel::load_with_config(model_path, cfg)?;
 
     highgui::named_window("Drone Analytics", highgui::WINDOW_NORMAL)?;
-    let mut state = init_source_state(&sources[source_idx], &out_dir, opts.output)?;
+    let (mut state, cap) = init_source_state(&sources[source_idx], &out_dir, opts.output, overlay_device.clone())?;
     let mut is_rtsp = is_rtsp_source(&sources[source_idx]);
+    let mut capture = Some(start_capture_thread(cap, state.stride, opts.io_buffer));
 
     if is_rtsp {
         highgui::resize_window("Drone Analytics", state.w, state.h)?;
@@ -183,15 +268,14 @@ fn process_video() -> Result<()> {
         highgui::resize_window("Drone Analytics", 1280, 720)?;
     }
 
-    let mut frame = Mat::default();
-    let mut idx = 0usize;
-
     'source_loop: loop {
-        while state.cap.read(&mut frame)? {
-            if idx % state.stride != 0 {
-                idx += 1;
-                continue;
-            }
+        let Some(rx) = capture.as_ref().map(|worker| worker.rx.clone()) else {
+            break;
+        };
+        let mut action: Option<i32> = None;
+        while let Ok(packet) = rx.recv() {
+            let mut frame = packet.frame;
+            let frame_idx = packet.idx;
 
             let input_arr = mat_to_array3_rgb(&frame)?;
             let results = model.predict_array(&input_arr, String::new())?;
@@ -239,7 +323,7 @@ fn process_video() -> Result<()> {
                 &det_confs,
                 &mut state.tracks,
                 &mut state.next_local_id,
-                idx,
+                frame_idx,
                 state.out_fps,
             );
 
@@ -272,18 +356,18 @@ fn process_video() -> Result<()> {
                 0
             };
 
-            let mut out = frame.clone();
-            overlay_heatmap(&state.heatmap, &mut out)?;
-            draw_trails(&mut out, &state.tracks)?;
-            draw_detections(&mut out, &dets)?;
-            draw_source_label(&mut out, &state.source_label)?;
+            let out = &mut frame;
+            overlay_heatmap(&state.heatmap, out)?;
+            draw_trails(out, &state.tracks)?;
+            draw_detections(out, &dets)?;
+            draw_source_label(out, &state.source_label)?;
             update_fps(&mut state);
             update_sysinfo(&mut state);
-            draw_sysinfo(&mut out, &state.sys_snapshot)?;
+            draw_sysinfo(out, &state.sys_snapshot, &state.device)?;
             let proc_fps = state.fps_value.max(0.0);
-            draw_hud(&mut out, congestion, proc_fps)?;
+            draw_hud(out, congestion, proc_fps, state.fps)?;
             if let Some(pub_) = state.mediamtx.as_mut() {
-                pub_.send(&out)?;
+                pub_.send(out)?;
             }
             if state.writer_active {
                 if let Some(limit) = state.write_limit {
@@ -293,38 +377,51 @@ fn process_video() -> Result<()> {
                     }
                 }
                 if state.writer_active {
-                    state.writer.write(&out)?;
+                    state.writer.write(out)?;
                     state.frames_written += 1;
                 }
             }
-            highgui::imshow("Drone Analytics", &out)?;
+            highgui::imshow("Drone Analytics", out)?;
             let key = highgui::wait_key(1)?;
+            if key == 113 {
+                action = Some(key);
+                break;
+            }
+            if key == 116 && sources.len() > 1 {
+                action = Some(key);
+                break;
+            }
+        }
+        if let Some(key) = action {
+            if let Some(worker) = capture.take() {
+                worker.stop()?;
+            }
             if key == 113 {
                 break 'source_loop;
             }
             if key == 116 && sources.len() > 1 {
                 source_idx = (source_idx + 1) % sources.len();
                 let next_source = sources[source_idx].clone();
-                state.cap.release()?;
                 state.writer.release()?;
-                state = init_source_state(&next_source, &out_dir, opts.output)?;
+                let (next_state, cap) = init_source_state(&next_source, &out_dir, opts.output, overlay_device.clone())?;
+                state = next_state;
+                capture = Some(start_capture_thread(cap, state.stride, opts.io_buffer));
                 is_rtsp = is_rtsp_source(&next_source);
                 if is_rtsp {
                     highgui::resize_window("Drone Analytics", state.w, state.h)?;
                 } else {
                     highgui::resize_window("Drone Analytics", 1280, 720)?;
                 }
-                idx = 0;
                 continue;
             }
-
-            idx += 1;
         }
         break;
     }
 
     state.writer.release()?;
-    state.cap.release()?;
+    if let Some(worker) = capture.take() {
+        worker.stop()?;
+    }
     highgui::destroy_all_windows()?;
     Ok(())
 }
@@ -497,7 +594,7 @@ fn draw_trails(frame: &mut Mat, tracks: &HashMap<i64, Track>) -> Result<()> {
                 frame,
                 Point::new(w[0].0 as i32, w[0].1 as i32),
                 Point::new(w[1].0 as i32, w[1].1 as i32),
-                Scalar::new(180.0, 180.0, 180.0, 0.0),
+                Scalar::new(0.0, 0.0, 255.0, 0.0),
                 TRAIL_THICKNESS,
                 imgproc::LINE_AA,
                 0,
@@ -539,7 +636,7 @@ fn draw_detections(frame: &mut Mat, dets: &[Detection]) -> Result<()> {
             Point::new(r.x, (r.y - 4).max(0)),
             imgproc::FONT_HERSHEY_SIMPLEX,
             0.4,
-            col,
+            Scalar::new(0.0, 0.0, 255.0, 0.0),
             1,
             imgproc::LINE_AA,
             false,
@@ -549,9 +646,10 @@ fn draw_detections(frame: &mut Mat, dets: &[Detection]) -> Result<()> {
 }
 
 // draw HUD
-fn draw_hud(frame: &mut Mat, pct: i32, proc_fps: f32) -> Result<()> {
+fn draw_hud(frame: &mut Mat, pct: i32, proc_fps: f32, src_fps: f64) -> Result<()> {
     let w = frame.cols();
     let margin = 30;
+    let label_col = Scalar::new(0.0, 255.0, 255.0, 0.0);
 
     let title = "CONGESTION INDEX";
     let title_scale = 0.7;
@@ -572,7 +670,7 @@ fn draw_hud(frame: &mut Mat, pct: i32, proc_fps: f32) -> Result<()> {
         Point::new(title_x, 50),
         imgproc::FONT_HERSHEY_DUPLEX,
         title_scale,
-        Scalar::all(255.0),
+        label_col,
         title_thickness,
         imgproc::LINE_AA,
         false,
@@ -592,12 +690,7 @@ fn draw_hud(frame: &mut Mat, pct: i32, proc_fps: f32) -> Result<()> {
 
     let pct_x = (w - margin - pct_size.width).max(0);
 
-    let col = Scalar::new(
-        0.0,
-        (255.0 - pct as f64 * 2.5).max(0.0),
-        (pct as f64 * 2.5).min(255.0),
-        0.0,
-    );
+    let col = value_color_pct(pct as f64, 30.0, 70.0);
 
     imgproc::put_text(
         frame,
@@ -612,16 +705,28 @@ fn draw_hud(frame: &mut Mat, pct: i32, proc_fps: f32) -> Result<()> {
     )?;
 
     let fps_text = format!("FPS {:.1}", proc_fps.max(0.0));
-    imgproc::put_text(
+    let src_fps_text = format!("SRC {:.1}", src_fps.max(0.0));
+    draw_label_value(
         frame,
-        &fps_text,
-        Point::new(pct_x, 150),
-        imgproc::FONT_HERSHEY_SIMPLEX,
+        "FPS ",
+        &format!("{:.1}", proc_fps.max(0.0)),
+        pct_x,
+        150,
         0.6,
-        Scalar::all(255.0),
         1,
-        imgproc::LINE_AA,
-        false,
+        label_col,
+        value_color_pct(proc_fps as f64, 10.0, 30.0),
+    )?;
+    draw_label_value(
+        frame,
+        "SRC ",
+        &format!("{:.1}", src_fps.max(0.0)),
+        pct_x,
+        172,
+        0.5,
+        1,
+        label_col,
+        value_color_pct(src_fps, 10.0, 30.0),
     )?;
 
     Ok(())
@@ -642,6 +747,8 @@ fn update_fps(state: &mut SourceState) {
 struct SysSnapshot {
     proc_cpu_pct: f32,
     proc_mem: u64,
+    num_cpus: usize,
+    gpu_util_pct: Option<f32>,
 }
 
 fn update_sysinfo(state: &mut SourceState) {
@@ -657,11 +764,20 @@ fn update_sysinfo(state: &mut SourceState) {
         );
     }
 
-    state.sys_snapshot = build_sys_snapshot(&state.sys, state.sys_pid);
+    let gpu_util_pct = if cfg!(target_os = "macos") && matches!(state.device, Device::CoreMl) {
+        read_coreml_gpu_util_pct()
+    } else {
+        None
+    };
+    state.sys_snapshot = build_sys_snapshot(&state.sys, state.sys_pid, gpu_util_pct);
     state.sys_last_update = Instant::now();
 }
 
-fn build_sys_snapshot(sys: &System, pid: Option<sysinfo::Pid>) -> SysSnapshot {
+fn build_sys_snapshot(
+    sys: &System,
+    pid: Option<sysinfo::Pid>,
+    gpu_util_pct: Option<f32>,
+) -> SysSnapshot {
     let (proc_cpu_pct, proc_mem) = pid
         .and_then(|p| sys.process(p))
         .map(|proc| (proc.cpu_usage(), proc.memory()))
@@ -670,39 +786,243 @@ fn build_sys_snapshot(sys: &System, pid: Option<sysinfo::Pid>) -> SysSnapshot {
     SysSnapshot {
         proc_cpu_pct,
         proc_mem,
+        num_cpus: sys.cpus().len(),
+        gpu_util_pct,
     }
 }
 
-fn draw_sysinfo(frame: &mut Mat, snap: &SysSnapshot) -> Result<()> {
+fn draw_sysinfo(frame: &mut Mat, snap: &SysSnapshot, device: &Device) -> Result<()> {
     let x = 30;
     let y0 = 60;
     let line = 22;
     let scale = 0.55;
     let thickness = 1;
-    let col = Scalar::all(255.0);
+    let label_col = Scalar::new(0.0, 255.0, 255.0, 0.0);
 
-    let cpu = format!("Proc CPU {:>4.1}%", snap.proc_cpu_pct.clamp(0.0, 100.0));
-    let proc = format!("Proc RAM {:.2} GB", bytes_to_gb(snap.proc_mem));
+    draw_label_value(
+        frame,
+        "DEVICE ",
+        &format_device_label(device),
+        x,
+        y0,
+        scale,
+        thickness,
+        label_col,
+        label_col,
+    )?;
 
-    let lines = [cpu, proc];
-    for (i, text) in lines.iter().enumerate() {
-        imgproc::put_text(
-            frame,
-            text,
-            Point::new(x, y0 + (i as i32 * line)),
-            imgproc::FONT_HERSHEY_SIMPLEX,
-            scale,
-            col,
-            thickness,
-            imgproc::LINE_AA,
-            false,
-        )?;
+    let cpu_val = if snap.num_cpus > 1 {
+        format!("{:>4.1}% ({}c)", snap.proc_cpu_pct.max(0.0), snap.num_cpus)
+    } else {
+        format!("{:>4.1}%", snap.proc_cpu_pct.max(0.0))
+    };
+    draw_label_value(
+        frame,
+        "PROC ",
+        &cpu_val,
+        x,
+        y0 + line,
+        scale,
+        thickness,
+        label_col,
+        value_color_pct(snap.proc_cpu_pct as f64, 35.0, 75.0),
+    )?;
+
+    let mut row = 2;
+    if !matches!(device, Device::Cpu) {
+        let gpu_text = match snap.gpu_util_pct {
+            Some(val) => {
+                draw_label_value(
+                    frame,
+                    "GPU ",
+                    &format!("{:>4.1}%", val.max(0.0)),
+                    x,
+                    y0 + (row as i32 * line),
+                    scale,
+                    thickness,
+                    label_col,
+                    value_color_pct(val as f64, 35.0, 75.0),
+                )?;
+                None
+            }
+            None => Some("N/A".to_string()),
+        };
+        if let Some(na) = gpu_text {
+            draw_label_value(
+                frame,
+                "GPU ",
+                &na,
+                x,
+                y0 + (row as i32 * line),
+                scale,
+                thickness,
+                label_col,
+                label_col,
+            )?;
+        }
+        row += 1;
     }
+
+    let mem_gb = bytes_to_gb(snap.proc_mem);
+    draw_label_value(
+        frame,
+        "RAM ",
+        &format!("{:.2} GB", mem_gb),
+        x,
+        y0 + (row as i32 * line),
+        scale,
+        thickness,
+        label_col,
+        value_color_pct(mem_gb, 2.0, 8.0),
+    )?;
     Ok(())
+}
+
+fn value_color_pct(value: f64, low: f64, high: f64) -> Scalar {
+    if value >= high {
+        Scalar::new(0.0, 0.0, 255.0, 0.0)
+    } else if value <= low {
+        Scalar::new(0.0, 255.0, 0.0, 0.0)
+    } else {
+        Scalar::new(0.0, 165.0, 255.0, 0.0)
+    }
+}
+
+fn draw_label_value(
+    frame: &mut Mat,
+    label: &str,
+    value: &str,
+    x: i32,
+    y: i32,
+    scale: f64,
+    thickness: i32,
+    label_col: Scalar,
+    value_col: Scalar,
+) -> Result<()> {
+    let mut base = 0;
+    let label_size = imgproc::get_text_size(
+        label,
+        imgproc::FONT_HERSHEY_SIMPLEX,
+        scale,
+        thickness,
+        &mut base,
+    )?;
+    imgproc::put_text(
+        frame,
+        label,
+        Point::new(x, y),
+        imgproc::FONT_HERSHEY_SIMPLEX,
+        scale,
+        label_col,
+        thickness,
+        imgproc::LINE_AA,
+        false,
+    )?;
+    imgproc::put_text(
+        frame,
+        value,
+        Point::new(x + label_size.width, y),
+        imgproc::FONT_HERSHEY_SIMPLEX,
+        scale,
+        value_col,
+        thickness,
+        imgproc::LINE_AA,
+        false,
+    )?;
+    Ok(())
+}
+
+fn format_device_label(device: &Device) -> String {
+    match device {
+        Device::Cpu => "CPU".to_string(),
+        Device::Cuda(idx) => format!("CUDA:{idx}"),
+        Device::Mps => "MPS".to_string(),
+        Device::CoreMl => "COREML".to_string(),
+        Device::DirectMl(idx) => format!("DIRECTML:{idx}"),
+        Device::OpenVino => "OPENVINO".to_string(),
+        Device::Xnnpack => "XNNPACK".to_string(),
+        Device::TensorRt(idx) => format!("TENSORRT:{idx}"),
+        Device::Rocm(idx) => format!("ROCM:{idx}"),
+    }
 }
 
 fn bytes_to_gb(bytes: u64) -> f64 {
     bytes as f64 / 1_073_741_824.0
+}
+
+fn read_coreml_gpu_util_pct() -> Option<f32> {
+    let output = Command::new("sudo")
+        .args([
+            "-n",
+            "powermetrics",
+            "--samplers",
+            "gpu_power",
+            "-n",
+            "1",
+        ])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_powermetrics_gpu_util(&stdout)
+}
+
+fn parse_powermetrics_gpu_util(text: &str) -> Option<f32> {
+    for line in text.lines() {
+        let lower = line.to_lowercase();
+        if !(lower.contains("gpu") && lower.contains("active")) {
+            continue;
+        }
+        if let Some((val, has_pct)) = extract_first_number(line) {
+            let pct = if has_pct {
+                val
+            } else if val <= 1.0 {
+                val * 100.0
+            } else {
+                val
+            };
+            return Some(pct);
+        }
+    }
+    None
+}
+
+fn extract_first_number(line: &str) -> Option<(f32, bool)> {
+    let mut buf = String::new();
+    let mut has_digit = false;
+    let mut has_dot = false;
+    let mut has_pct = false;
+
+    for ch in line.chars() {
+        if ch.is_ascii_digit() {
+            has_digit = true;
+            buf.push(ch);
+            continue;
+        }
+        if ch == '.' && !has_dot {
+            has_dot = true;
+            buf.push(ch);
+            continue;
+        }
+        if ch == '%' && has_digit {
+            has_pct = true;
+            break;
+        }
+        if has_digit {
+            break;
+        }
+    }
+
+    if !has_digit {
+        return None;
+    }
+
+    let val = buf.parse::<f32>().ok()?;
+    Some((val, has_pct))
 }
 
 // convert Mat -> RGB ndarray
@@ -737,7 +1057,6 @@ fn class_color(class_id: i64) -> Scalar {
 }
 
 struct SourceState {
-    cap: videoio::VideoCapture,
     fps: f64,
     w: i32,
     h: i32,
@@ -760,10 +1079,31 @@ struct SourceState {
     fps_frames: usize,
     fps_value: f32,
     mediamtx: Option<RtspPublisher>,
+    device: Device,
 }
 
-fn init_source_state(source: &str, out_dir: &Path, output: OutputFormat) -> Result<SourceState> {
-    let mut cap = videoio::VideoCapture::from_file(source, videoio::CAP_ANY)?;
+fn init_source_state(
+    source: &str,
+    out_dir: &Path,
+    output: OutputFormat,
+    device: Device,
+) -> Result<(SourceState, videoio::VideoCapture)> {
+    // Drop corrupt frames for FFmpeg backend (helps with damaged MP4/RTSP streams).
+    // SAFETY: We only set a process-wide env var before opening the capture.
+    unsafe {
+        if is_rtsp_source(source) {
+            std::env::set_var(
+                "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+                "rtsp_transport;tcp|fflags;discardcorrupt|err_detect;ignore_err",
+            );
+        } else {
+            std::env::set_var(
+                "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+                "fflags;discardcorrupt|err_detect;ignore_err",
+            );
+        }
+    }
+    let cap = videoio::VideoCapture::from_file(source, videoio::CAP_ANY)?;
     if !cap.is_opened()? {
         return Err(anyhow!("Could not open video"));
     }
@@ -816,7 +1156,7 @@ let h = cap.get(videoio::CAP_PROP_FRAME_HEIGHT)? as i32;
     let writer = {
         let mut wtr = None;
         for codec in codecs {
-            let mut candidate = videoio::VideoWriter::new(
+            let candidate = videoio::VideoWriter::new(
                 out_path.to_str().unwrap(),
                 codec,
                 out_fps,
@@ -854,10 +1194,14 @@ let h = cap.get(videoio::CAP_PROP_FRAME_HEIGHT)? as i32;
             ProcessRefreshKind::nothing().with_cpu().with_memory(),
         );
     }
-    let sys_snapshot = build_sys_snapshot(&sys, sys_pid);
+    let gpu_util_pct = if cfg!(target_os = "macos") && matches!(device, Device::CoreMl) {
+        read_coreml_gpu_util_pct()
+    } else {
+        None
+    };
+    let sys_snapshot = build_sys_snapshot(&sys, sys_pid, gpu_util_pct);
 
-    Ok(SourceState {
-        cap,
+    Ok((SourceState {
         fps,
         w,
         h,
@@ -879,8 +1223,9 @@ let h = cap.get(videoio::CAP_PROP_FRAME_HEIGHT)? as i32;
         fps_last_update: Instant::now(),
         fps_frames: 0,
         fps_value: 0.0,
-        mediamtx, // ✅ FIXED
-    })
+        mediamtx,
+        device,
+    }, cap))
 }
 
 

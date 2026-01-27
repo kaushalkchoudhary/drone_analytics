@@ -17,9 +17,9 @@ pub const HEATMAP_DECAY: f32 = 0.95;
 pub const HEATMAP_RADIUS: i32 = 10;
 
 // Speed thresholds (px/sec)
-pub const THRESH_STALLED: f32 = 15.0;
-pub const THRESH_SLOW: f32 = 80.0;
-pub const THRESH_MEDIUM: f32 = 250.0;
+pub const THRESH_STALLED: f32 = 8.0;
+pub const THRESH_SLOW: f32 = 50.0;
+pub const THRESH_MEDIUM: f32 = 160.0;
 
 // ALL VisDrone classes
 pub const TARGET_CLASSES: [i64; 6] = [3, 4, 5, 7, 8, 9];
@@ -81,7 +81,7 @@ impl SpeedClass {
 
     pub fn as_str(self) -> &'static str {
         match self {
-            SpeedClass::Stalled => "",
+            SpeedClass::Stalled => "STALLED",
             SpeedClass::Slow => "SLOW",
             SpeedClass::Medium => "MEDIUM",
             SpeedClass::Fast => "FAST",
@@ -96,11 +96,13 @@ pub fn bbox_bottom_center(b: BBox) -> (f32, f32) {
 }
 
 pub fn smooth_speed(prev: f32, curr: f32) -> f32 {
-    if prev == 0.0 { curr } else { prev * 0.7 + curr * 0.3 }
+    if prev == 0.0 { curr } else { prev * 0.4 + curr * 0.6 }
 }
 
 pub fn classify_speed(speed: f32) -> SpeedClass {
-    if speed < THRESH_SLOW {
+    if speed < THRESH_STALLED {
+        SpeedClass::Stalled
+    } else if speed < THRESH_SLOW {
         SpeedClass::Slow
     } else if speed < THRESH_MEDIUM {
         SpeedClass::Medium
