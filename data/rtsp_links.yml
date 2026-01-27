@@ -1,0 +1,15 @@
+# rtsp_sources.yml
+
+rtsp_links:
+  - rtsp://bcp:bcp123@57.159.25.115:8554/bcpdrone1
+  - rtsp://bcp:bcp123@57.159.25.115:8554/bcpdrone2
+  - rtsp://bcp:bcp123@57.159.25.115:8554/bcpdrone3
+  - rtsp://bcp:bcp123@57.159.25.115:8554/bcpdrone4
+  - rtsp://bcp:bcp123@57.159.25.115:8554/bcpdrone5
+  - rtsp://bcp:bcp123@57.159.25.115:8554/bcpdrone6
+  - rtsp://bcp:bcp123@57.159.25.115:8554/bcpdrone7
+  - rtsp://bcp:bcp123@57.159.25.115:8554/bcpdrone8
+  - rtsp://bcp:bcp123@57.159.25.115:8554/bcpdrone9
+  - rtsp://bcp:bcp123@57.159.25.115:8554/bcpdrone10
+  - rtsp://bcp:bcp123@57.159.25.115:8554/bcpdrone11
+  - rtsp://bcp:bcp123@57.159.25.115:8554/bcpdrone12
