@@ -9,16 +9,103 @@ use opencv::{
     core::{self, AlgorithmHint, Mat, Point, Rect, Scalar, Size},
     highgui, imgproc, prelude::*, videoio,
 };
-use std::{collections::{HashMap, HashSet}, env, fs, path::{Path, PathBuf}};
+use sysinfo::{get_current_pid, ProcessRefreshKind, ProcessesToUpdate, System};
+use std::{collections::{HashMap, HashSet}, env, fs, path::{Path, PathBuf}, str::FromStr};
+use std::time::{Duration, Instant};
 use serde::Deserialize;
-use ultralytics_inference::{InferenceConfig, YOLOModel};
+use ultralytics_inference::{Device, InferenceConfig, YOLOModel};
 
 mod state;
 use state::*;
+mod mediamtx;
+use mediamtx::*;
 
 // entry point
 fn main() -> Result<()> {
     process_video()
+}
+
+#[derive(Clone, Copy, Debug)]
+enum OutputFormat {
+    Mkv,
+    Mp4,
+}
+
+#[derive(Debug)]
+struct CliOptions {
+    source: Option<String>,
+    use_rtsp: bool,
+    rtsp_index: Option<usize>,
+    output: OutputFormat,
+    device: Option<Device>,
+    threads: Option<usize>,
+}
+
+fn parse_args() -> Result<CliOptions> {
+    let mut opts = CliOptions {
+        source: None,
+        use_rtsp: false,
+        rtsp_index: None,
+        output: OutputFormat::Mkv,
+        device: None,
+        threads: None,
+    };
+
+    let mut iter = env::args().skip(1).peekable();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--rtsp" => opts.use_rtsp = true,
+            "--mp4" => opts.output = OutputFormat::Mp4,
+            "--mkv" => opts.output = OutputFormat::Mkv,
+            "--index" => {
+                let idx = iter.next().ok_or_else(|| anyhow!("--index requires a value"))?;
+                let parsed = idx.parse::<usize>()
+                    .map_err(|_| anyhow!("--index must be a positive integer"))?;
+                opts.rtsp_index = Some(parsed.saturating_sub(1));
+            }
+            "--threads" => {
+                let threads = iter.next().ok_or_else(|| anyhow!("--threads requires a value"))?;
+                let parsed = threads
+                    .parse::<usize>()
+                    .map_err(|_| anyhow!("--threads must be a non-negative integer"))?;
+                opts.threads = Some(parsed);
+            }
+            "--device" => {
+                let device = iter.next().ok_or_else(|| anyhow!("--device requires a value"))?;
+                let parsed = Device::from_str(&device)
+                    .map_err(|err| anyhow!("Invalid --device value '{device}': {err}"))?;
+                opts.device = Some(parsed);
+            }
+            "--cpu" => {
+                opts.device = Some(Device::Cpu);
+            }
+            "--gpu" => {
+                let device = if cfg!(target_os = "macos") {
+                    Device::Mps
+                } else {
+                    Device::Cuda(0)
+                };
+                opts.device = Some(device);
+            }
+            _ if arg.starts_with("--") => {
+                let rest = arg.trim_start_matches("--");
+                if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
+                    let parsed = rest.parse::<usize>()
+                        .map_err(|_| anyhow!("Invalid RTSP index flag: {arg}"))?;
+                    opts.rtsp_index = Some(parsed.saturating_sub(1));
+                } else if opts.source.is_none() {
+                    opts.source = Some(arg);
+                }
+            }
+            _ => {
+                if opts.source.is_none() {
+                    opts.source = Some(arg);
+                }
+            }
+        }
+    }
+
+    Ok(opts)
 }
 
 // full pipeline
@@ -29,61 +116,55 @@ fn process_video() -> Result<()> {
     let default_input = data_dir.join("drone8.mp4");
     let rtsp_config = data_dir.join("rtsp_links.yml");
 
-    let input_arg = env::args().nth(1);
-    let input_source = match input_arg {
-        Some(arg) => arg,
-        None => {
-            let rtsp_links = load_rtsp_links(&rtsp_config)?;
-            if let Some(first) = rtsp_links.into_iter().find(|s| !s.trim().is_empty()) {
-                first
+    let rtsp_links = load_rtsp_links(&rtsp_config)?;
+    let opts = parse_args()?;
+    let (mut sources, mut source_idx) = match opts.source {
+        Some(arg) => {
+            if is_rtsp_source(&arg) {
+                if let Some(pos) = rtsp_links.iter().position(|s| s == &arg) {
+                    (rtsp_links, pos)
+                } else {
+                    (vec![arg], 0)
+                }
             } else {
-                default_input.to_string_lossy().to_string()
+                (vec![arg], 0)
+            }
+        }
+        None => {
+            if opts.use_rtsp {
+                if rtsp_links.is_empty() {
+                    return Err(anyhow!("No RTSP links found in {}", rtsp_config.display()));
+                }
+                let idx = opts.rtsp_index.unwrap_or(0).min(rtsp_links.len().saturating_sub(1));
+                (rtsp_links, idx)
+            } else if !rtsp_links.is_empty() {
+                let idx = opts.rtsp_index.unwrap_or(0).min(rtsp_links.len().saturating_sub(1));
+                (rtsp_links, idx)
+            } else {
+                (vec![default_input.to_string_lossy().to_string()], 0)
             }
         }
     };
 
-    let is_rtsp = is_rtsp_source(&input_source);
-    let input_path = PathBuf::from(&input_source);
-    if !is_rtsp && !input_path.exists() {
-        return Err(anyhow!("Input not found: {}", input_path.display()));
+    sources.retain(|s| !s.trim().is_empty());
+    if sources.is_empty() {
+        sources.push(default_input.to_string_lossy().to_string());
+        source_idx = 0;
     }
 
-    let timestamp = Local::now().format("%Y%m%d_%H%M%S");
     let out_dir = root.join("runs/drone_analysis");
     fs::create_dir_all(&out_dir)?;
-    let out_path = out_dir.join(format!("drone_analysis_{timestamp}.mp4"));
 
-    let mut cap = videoio::VideoCapture::from_file(&input_source, videoio::CAP_ANY)?;
-    if !cap.is_opened()? {
-        return Err(anyhow!("Could not open video"));
-    }
-
-    let fps = cap.get(videoio::CAP_PROP_FPS)?;
-    if fps <= 0.0 {
-        return Err(anyhow!("Invalid FPS"));
-    }
-
-    let w = cap.get(videoio::CAP_PROP_FRAME_WIDTH)? as i32;
-    let h = cap.get(videoio::CAP_PROP_FRAME_HEIGHT)? as i32;
-
-    let stride = (fps / TARGET_FPS).round().max(1.0) as usize;
-    let out_fps = fps / stride as f64;
-
-    let mut writer = videoio::VideoWriter::new(
-        out_path.to_str().unwrap(),
-        videoio::VideoWriter::fourcc('a', 'v', 'c', '1')?,
-        out_fps,
-        Size::new(w, h),
-        true,
-    )?;
-    if !writer.is_opened()? {
-        return Err(anyhow!("VideoWriter failed to open (avc1)."));
-    }
-
-    let cfg = InferenceConfig::new()
+    let mut cfg = InferenceConfig::new()
         .with_confidence(CONF_THRESH)
         .with_iou(0.45)
         .with_max_det(500);
+    if let Some(threads) = opts.threads {
+        cfg = cfg.with_threads(threads);
+    }
+    if let Some(device) = opts.device {
+        cfg = cfg.with_device(device);
+    }
 
     let model_path = data_dir.join("yolov11n-visdrone.onnx");
     if !model_path.exists() {
@@ -92,128 +173,158 @@ fn process_video() -> Result<()> {
 
     let mut model = YOLOModel::load_with_config(model_path, cfg)?;
 
-    let mut tracker = ByteTracker::new(
-        out_fps.round().max(1.0) as usize,
-        TRACK_BUFFER,
-        TRACK_THRESH,
-        HIGH_THRESH,
-        MATCH_THRESH,
-    );
-
-    let mut tracks: HashMap<i64, Track> = HashMap::new();
-    let mut next_local_id: i64 = -1;
-    let mut heatmap = Mat::zeros(h, w, core::CV_32F)?.to_mat()?;
-
     highgui::named_window("Drone Analytics", highgui::WINDOW_NORMAL)?;
-    highgui::resize_window("Drone Analytics", 1280, 720)?;
+    let mut state = init_source_state(&sources[source_idx], &out_dir, opts.output)?;
+    let mut is_rtsp = is_rtsp_source(&sources[source_idx]);
+
+    if is_rtsp {
+        highgui::resize_window("Drone Analytics", state.w, state.h)?;
+    } else {
+        highgui::resize_window("Drone Analytics", 1280, 720)?;
+    }
 
     let mut frame = Mat::default();
     let mut idx = 0usize;
 
-    while cap.read(&mut frame)? {
-        if idx % stride != 0 {
-            idx += 1;
-            continue;
-        }
+    'source_loop: loop {
+        while state.cap.read(&mut frame)? {
+            if idx % state.stride != 0 {
+                idx += 1;
+                continue;
+            }
 
-        let input_arr = mat_to_array3_rgb(&frame)?;
-        let results = model.predict_array(&input_arr, String::new())?;
+            let input_arr = mat_to_array3_rgb(&frame)?;
+            let results = model.predict_array(&input_arr, String::new())?;
 
-        let mut objects: Vec<Object> = Vec::new();
-        let mut classes: Vec<i64> = Vec::new();
-        let mut det_confs: Vec<f32> = Vec::new();
+            let mut objects: Vec<Object> = Vec::new();
+            let mut classes: Vec<i64> = Vec::new();
+            let mut det_confs: Vec<f32> = Vec::new();
 
-        if let Some(r0) = results.get(0) {
-            if let Some(boxes) = r0.boxes.as_ref() {
-                let xyxy = boxes.xyxy().to_owned();
-                let conf = boxes.conf().to_owned();
-                let cls = boxes.cls().to_owned();
+            if let Some(r0) = results.get(0) {
+                if let Some(boxes) = r0.boxes.as_ref() {
+                    let xyxy = boxes.xyxy().to_owned();
+                    let conf = boxes.conf().to_owned();
+                    let cls = boxes.cls().to_owned();
 
-                for i in 0..boxes.len() {
-                    let cid = cls[i] as i64;
-                    if !TARGET_CLASSES.contains(&cid) {
-                        continue;
+                    for i in 0..boxes.len() {
+                        let cid = cls[i] as i64;
+                        if !TARGET_CLASSES.contains(&cid) {
+                            continue;
+                        }
+
+                        let x1 = xyxy[[i, 0]];
+                        let y1 = xyxy[[i, 1]];
+                        let x2 = xyxy[[i, 2]];
+                        let y2 = xyxy[[i, 3]];
+
+                        if x2 <= x1 || y2 <= y1 {
+                            continue;
+                        }
+
+                        objects.push(Object::new(
+                            JamRect::from_xyxy(x1, y1, x2, y2),
+                            conf[i],
+                            None,
+                        ));
+                        classes.push(cid);
+                        det_confs.push(conf[i]);
                     }
-
-                    let x1 = xyxy[[i, 0]];
-                    let y1 = xyxy[[i, 1]];
-                    let x2 = xyxy[[i, 2]];
-                    let y2 = xyxy[[i, 3]];
-
-                    if x2 <= x1 || y2 <= y1 {
-                        continue;
-                    }
-
-                    objects.push(Object::new(
-                        JamRect::from_xyxy(x1, y1, x2, y2),
-                        conf[i],
-                        None,
-                    ));
-                    classes.push(cid);
-                    det_confs.push(conf[i]);
                 }
             }
+
+            let tracked = state.tracker.update(&objects)?;
+            let dets = apply_tracks(
+                tracked,
+                &classes,
+                &det_confs,
+                &mut state.tracks,
+                &mut state.next_local_id,
+                idx,
+                state.out_fps,
+            );
+
+            decay_heatmap(&mut state.heatmap)?;
+            update_heatmap(&mut state.heatmap, &dets)?;
+
+            let mut counts = [0usize; 4];
+            for d in &dets {
+                counts[d.speed.bucket()] += 1;
+            }
+
+            let total = dets.len();
+            let congestion = if total > 0 {
+                let score =
+                    counts[0] as f32 * 0.85 +
+                    counts[1] as f32 * 0.55 +
+                    counts[2] as f32 * 0.25 +
+                    counts[3] as f32 * 0.05;
+
+                let base = (score / total as f32) * 100.0;
+
+                let dens = density_factor(&state.heatmap, total)?;
+                let clus = cluster_factor(&state.heatmap)?;
+
+                let dens_adj = (dens - 1.0) * 18.0;
+                let clus_adj = (clus - 1.0) * 22.0;
+
+                (base + dens_adj + clus_adj).clamp(0.0, 100.0) as i32
+            } else {
+                0
+            };
+
+            let mut out = frame.clone();
+            overlay_heatmap(&state.heatmap, &mut out)?;
+            draw_trails(&mut out, &state.tracks)?;
+            draw_detections(&mut out, &dets)?;
+            draw_source_label(&mut out, &state.source_label)?;
+            update_fps(&mut state);
+            update_sysinfo(&mut state);
+            draw_sysinfo(&mut out, &state.sys_snapshot)?;
+            let proc_fps = state.fps_value.max(0.0);
+            draw_hud(&mut out, congestion, proc_fps)?;
+            if let Some(pub_) = state.mediamtx.as_mut() {
+                pub_.send(&out)?;
+            }
+            if state.writer_active {
+                if let Some(limit) = state.write_limit {
+                    if state.frames_written >= limit {
+                        state.writer.release()?;
+                        state.writer_active = false;
+                    }
+                }
+                if state.writer_active {
+                    state.writer.write(&out)?;
+                    state.frames_written += 1;
+                }
+            }
+            highgui::imshow("Drone Analytics", &out)?;
+            let key = highgui::wait_key(1)?;
+            if key == 113 {
+                break 'source_loop;
+            }
+            if key == 116 && sources.len() > 1 {
+                source_idx = (source_idx + 1) % sources.len();
+                let next_source = sources[source_idx].clone();
+                state.cap.release()?;
+                state.writer.release()?;
+                state = init_source_state(&next_source, &out_dir, opts.output)?;
+                is_rtsp = is_rtsp_source(&next_source);
+                if is_rtsp {
+                    highgui::resize_window("Drone Analytics", state.w, state.h)?;
+                } else {
+                    highgui::resize_window("Drone Analytics", 1280, 720)?;
+                }
+                idx = 0;
+                continue;
+            }
+
+            idx += 1;
         }
-
-        let tracked = tracker.update(&objects)?;
-        let dets = apply_tracks(
-            tracked,
-            &classes,
-            &det_confs,
-            &mut tracks,
-            &mut next_local_id,
-            idx,
-            out_fps,
-        );
-
-        decay_heatmap(&mut heatmap)?;
-        update_heatmap(&mut heatmap, &dets)?;
-
-        let mut counts = [0usize; 4];
-        for d in &dets {
-            counts[d.speed.bucket()] += 1;
-        }
-
-        let total = dets.len();
-        let congestion = if total > 0 {
-            let score =
-                counts[0] as f32 * 0.85 +
-                counts[1] as f32 * 0.55 +
-                counts[2] as f32 * 0.25 +
-                counts[3] as f32 * 0.05;
-
-            let base = (score / total as f32) * 100.0;
-
-            let dens = density_factor(&heatmap, total)?;
-            let clus = cluster_factor(&heatmap)?;
-
-            let dens_adj = (dens - 1.0) * 18.0;
-            let clus_adj = (clus - 1.0) * 22.0;
-
-            (base + dens_adj + clus_adj).clamp(0.0, 100.0) as i32
-        } else {
-            0
-        };
-
-
-
-        let mut out = frame.clone();
-        overlay_heatmap(&heatmap, &mut out)?;
-        draw_trails(&mut out, &tracks)?;
-        draw_detections(&mut out, &dets)?;
-        draw_hud(&mut out, congestion)?;
-
-        writer.write(&out)?;
-        highgui::imshow("Drone Analytics", &out)?;
-        if highgui::wait_key(1)? == 113 {
-            break;
-        }
-
-        idx += 1;
+        break;
     }
 
-    writer.release()?;
-    cap.release()?;
+    state.writer.release()?;
+    state.cap.release()?;
     highgui::destroy_all_windows()?;
     Ok(())
 }
@@ -438,7 +549,7 @@ fn draw_detections(frame: &mut Mat, dets: &[Detection]) -> Result<()> {
 }
 
 // draw HUD
-fn draw_hud(frame: &mut Mat, pct: i32) -> Result<()> {
+fn draw_hud(frame: &mut Mat, pct: i32, proc_fps: f32) -> Result<()> {
     let w = frame.cols();
     let margin = 30;
 
@@ -500,7 +611,98 @@ fn draw_hud(frame: &mut Mat, pct: i32) -> Result<()> {
         false,
     )?;
 
+    let fps_text = format!("FPS {:.1}", proc_fps.max(0.0));
+    imgproc::put_text(
+        frame,
+        &fps_text,
+        Point::new(pct_x, 150),
+        imgproc::FONT_HERSHEY_SIMPLEX,
+        0.6,
+        Scalar::all(255.0),
+        1,
+        imgproc::LINE_AA,
+        false,
+    )?;
+
     Ok(())
+}
+
+fn update_fps(state: &mut SourceState) {
+    state.fps_frames += 1;
+    let elapsed = state.fps_last_update.elapsed();
+    if elapsed >= Duration::from_secs(1) {
+        let secs = elapsed.as_secs_f32().max(0.001);
+        state.fps_value = state.fps_frames as f32 / secs;
+        state.fps_frames = 0;
+        state.fps_last_update = Instant::now();
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SysSnapshot {
+    proc_cpu_pct: f32,
+    proc_mem: u64,
+}
+
+fn update_sysinfo(state: &mut SourceState) {
+    if state.sys_last_update.elapsed() < Duration::from_secs(1) {
+        return;
+    }
+
+    if let Some(pid) = state.sys_pid {
+        state.sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            false,
+            ProcessRefreshKind::nothing().with_cpu().with_memory(),
+        );
+    }
+
+    state.sys_snapshot = build_sys_snapshot(&state.sys, state.sys_pid);
+    state.sys_last_update = Instant::now();
+}
+
+fn build_sys_snapshot(sys: &System, pid: Option<sysinfo::Pid>) -> SysSnapshot {
+    let (proc_cpu_pct, proc_mem) = pid
+        .and_then(|p| sys.process(p))
+        .map(|proc| (proc.cpu_usage(), proc.memory()))
+        .unwrap_or((0.0, 0));
+
+    SysSnapshot {
+        proc_cpu_pct,
+        proc_mem,
+    }
+}
+
+fn draw_sysinfo(frame: &mut Mat, snap: &SysSnapshot) -> Result<()> {
+    let x = 30;
+    let y0 = 60;
+    let line = 22;
+    let scale = 0.55;
+    let thickness = 1;
+    let col = Scalar::all(255.0);
+
+    let cpu = format!("Proc CPU {:>4.1}%", snap.proc_cpu_pct.clamp(0.0, 100.0));
+    let proc = format!("Proc RAM {:.2} GB", bytes_to_gb(snap.proc_mem));
+
+    let lines = [cpu, proc];
+    for (i, text) in lines.iter().enumerate() {
+        imgproc::put_text(
+            frame,
+            text,
+            Point::new(x, y0 + (i as i32 * line)),
+            imgproc::FONT_HERSHEY_SIMPLEX,
+            scale,
+            col,
+            thickness,
+            imgproc::LINE_AA,
+            false,
+        )?;
+    }
+    Ok(())
+}
+
+fn bytes_to_gb(bytes: u64) -> f64 {
+    bytes as f64 / 1_073_741_824.0
 }
 
 // convert Mat -> RGB ndarray
@@ -527,12 +729,198 @@ fn class_color(class_id: i64) -> Scalar {
         3 => Scalar::new(20.0, 190.0, 255.0, 0.0),    // car (orange)
         4 => Scalar::new(255.0, 120.0, 40.0, 0.0),    // van (blue)
         5 => Scalar::new(60.0, 255.0, 120.0, 0.0),    // truck (green)
+        7 => Scalar::new(255.0, 220.0, 50.0, 0.0),    // awning-tricycle (gold)
         8 => Scalar::new(255.0, 70.0, 200.0, 0.0),    // bus (pink)
         9 => Scalar::new(80.0, 220.0, 60.0, 0.0),     // motor (lime)
         _ => Scalar::new(210.0, 210.0, 210.0, 0.0),
     }
 }
 
+struct SourceState {
+    cap: videoio::VideoCapture,
+    fps: f64,
+    w: i32,
+    h: i32,
+    stride: usize,
+    out_fps: f64,
+    writer: videoio::VideoWriter,
+    writer_active: bool,
+    write_limit: Option<usize>,
+    frames_written: usize,
+    tracker: ByteTracker,
+    tracks: HashMap<i64, Track>,
+    next_local_id: i64,
+    heatmap: Mat,
+    source_label: String,
+    sys: System,
+    sys_pid: Option<sysinfo::Pid>,
+    sys_last_update: Instant,
+    sys_snapshot: SysSnapshot,
+    fps_last_update: Instant,
+    fps_frames: usize,
+    fps_value: f32,
+    mediamtx: Option<RtspPublisher>,
+}
+
+fn init_source_state(source: &str, out_dir: &Path, output: OutputFormat) -> Result<SourceState> {
+    let mut cap = videoio::VideoCapture::from_file(source, videoio::CAP_ANY)?;
+    if !cap.is_opened()? {
+        return Err(anyhow!("Could not open video"));
+    }
+
+    let fps = cap.get(videoio::CAP_PROP_FPS)?;
+    if fps <= 0.0 {
+        return Err(anyhow!("Invalid FPS"));
+    }
+
+let w = cap.get(videoio::CAP_PROP_FRAME_WIDTH)? as i32;
+let h = cap.get(videoio::CAP_PROP_FRAME_HEIGHT)? as i32;
+
+    let mediamtx = if is_rtsp_source(source) {
+        let publish_url = std::env::var("MEDIAMTX_PUBLISH_URL")
+            .unwrap_or_else(|_| "rtsp://127.0.0.1:8554/analytics".to_string());
+        Some(start_rtsp_publisher(w, h, fps, &publish_url)?)
+    } else {
+        None
+    };
+
+
+
+    let stride = 1usize;
+    let out_fps = fps;
+
+    let timestamp = Local::now().format("%Y%m%d_%H%M%S");
+    let (out_path, codecs, err_label) = match output {
+        OutputFormat::Mp4 => (
+            out_dir.join(format!("drone_analysis_{timestamp}.mp4")),
+            vec![
+                videoio::VideoWriter::fourcc('m', 'p', '4', 'v')?,
+                videoio::VideoWriter::fourcc('a', 'v', 'c', '1')?,
+                videoio::VideoWriter::fourcc('H', '2', '6', '4')?,
+                videoio::VideoWriter::fourcc('X', '2', '6', '4')?,
+            ],
+            "mp4",
+        ),
+        OutputFormat::Mkv => (
+            out_dir.join(format!("drone_analysis_{timestamp}.mkv")),
+            vec![
+                videoio::VideoWriter::fourcc('H', '2', '6', '4')?,
+                videoio::VideoWriter::fourcc('X', '2', '6', '4')?,
+                videoio::VideoWriter::fourcc('a', 'v', 'c', '1')?,
+                videoio::VideoWriter::fourcc('M', 'J', 'P', 'G')?,
+            ],
+            "mkv",
+        ),
+    };
+
+    let writer = {
+        let mut wtr = None;
+        for codec in codecs {
+            let mut candidate = videoio::VideoWriter::new(
+                out_path.to_str().unwrap(),
+                codec,
+                out_fps,
+                Size::new(w, h),
+                true,
+            )?;
+            if candidate.is_opened()? {
+                wtr = Some(candidate);
+                break;
+            }
+        }
+        wtr.ok_or_else(|| anyhow!("VideoWriter failed to open ({err_label})."))?
+    };
+
+    let write_limit = if is_rtsp_source(source) {
+        Some((out_fps * RTSP_SAVE_SECONDS).round().max(1.0) as usize)
+    } else {
+        None
+    };
+
+    let tracker = ByteTracker::new(
+        out_fps.round().max(1.0) as usize,
+        TRACK_BUFFER,
+        TRACK_THRESH,
+        HIGH_THRESH,
+        MATCH_THRESH,
+    );
+
+    let mut sys = System::new_all();
+    let sys_pid = get_current_pid().ok();
+    if let Some(pid) = sys_pid {
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            false,
+            ProcessRefreshKind::nothing().with_cpu().with_memory(),
+        );
+    }
+    let sys_snapshot = build_sys_snapshot(&sys, sys_pid);
+
+    Ok(SourceState {
+        cap,
+        fps,
+        w,
+        h,
+        stride,
+        out_fps,
+        writer,
+        writer_active: true,
+        write_limit,
+        frames_written: 0,
+        tracker,
+        tracks: HashMap::new(),
+        next_local_id: -1,
+        heatmap: Mat::zeros(h, w, core::CV_32F)?.to_mat()?,
+        source_label: source_display_name(source),
+        sys,
+        sys_pid,
+        sys_last_update: Instant::now(),
+        sys_snapshot,
+        fps_last_update: Instant::now(),
+        fps_frames: 0,
+        fps_value: 0.0,
+        mediamtx, // ✅ FIXED
+    })
+}
+
+
+fn draw_source_label(frame: &mut Mat, label: &str) -> Result<()> {
+    let title = if label.is_empty() { "source" } else { label };
+    let scale = 0.7;
+    let thickness = 2;
+    imgproc::put_text(
+        frame,
+        title,
+        Point::new(30, 30),
+        imgproc::FONT_HERSHEY_DUPLEX,
+        scale,
+        Scalar::all(255.0),
+        thickness,
+        imgproc::LINE_AA,
+        false,
+    )?;
+    Ok(())
+}
+
+fn source_display_name(source: &str) -> String {
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    if is_rtsp_source(trimmed) {
+        let base = trimmed.split('?').next().unwrap_or(trimmed);
+        let last = base.rsplit('/').next().unwrap_or(base);
+        return last.to_string();
+    }
+
+    let base = trimmed.split('?').next().unwrap_or(trimmed);
+    Path::new(base)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(base)
+        .to_string()
+}
 
 // class name mapping
 fn class_name(cid: i64) -> &'static str {
@@ -540,6 +928,7 @@ fn class_name(cid: i64) -> &'static str {
         3 => "car",
         4 => "van",
         5 => "truck",
+        7 => "awning-tricycle",
         8 => "bus",
         9 => "motor",
         _ => "obj",

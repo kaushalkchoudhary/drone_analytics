@@ -1,8 +1,8 @@
 // src/state.rs
 
 
-pub const TARGET_FPS: f64 = 10.0;
 pub const CONF_THRESH: f32 = 0.10;
+pub const RTSP_SAVE_SECONDS: f64 = 60.0;
 
 // ByteTrack params
 pub const TRACK_BUFFER: usize = 30;
@@ -22,7 +22,7 @@ pub const THRESH_SLOW: f32 = 80.0;
 pub const THRESH_MEDIUM: f32 = 250.0;
 
 // ALL VisDrone classes
-pub const TARGET_CLASSES: [i64; 5] = [3, 4, 5, 8, 9];
+pub const TARGET_CLASSES: [i64; 6] = [3, 4, 5, 7, 8, 9];
 
 // Trails
 pub const MAX_TRAIL_LEN: usize = 15;

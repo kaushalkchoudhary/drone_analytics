@@ -12,3 +12,9 @@ chrono = "0.4"
 ndarray = "=0.17.2"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
+sysinfo = "0.38.0"
+
+[features]
+default = []
+coreml = ["ultralytics-inference/coreml"]
+cuda = ["ultralytics-inference/cuda"]
