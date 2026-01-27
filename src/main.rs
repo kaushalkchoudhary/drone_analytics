@@ -20,6 +20,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
+        Mutex,
     },
     thread::{self, JoinHandle},
 };
@@ -402,6 +403,7 @@ fn process_video() -> Result<()> {
             if key == 116 && sources.len() > 1 {
                 source_idx = (source_idx + 1) % sources.len();
                 let next_source = sources[source_idx].clone();
+                stop_gpu_poller(&mut state);
                 state.writer.release()?;
                 let (next_state, cap) = init_source_state(&next_source, &out_dir, opts.output, overlay_device.clone())?;
                 state = next_state;
@@ -418,6 +420,7 @@ fn process_video() -> Result<()> {
         break;
     }
 
+    stop_gpu_poller(&mut state);
     state.writer.release()?;
     if let Some(worker) = capture.take() {
         worker.stop()?;
@@ -764,11 +767,10 @@ fn update_sysinfo(state: &mut SourceState) {
         );
     }
 
-    let gpu_util_pct = if cfg!(target_os = "macos") && matches!(state.device, Device::CoreMl) {
-        read_coreml_gpu_util_pct()
-    } else {
-        None
-    };
+    let gpu_util_pct = state
+        .gpu_util_shared
+        .as_ref()
+        .and_then(|shared| shared.lock().ok().and_then(|v| *v));
     state.sys_snapshot = build_sys_snapshot(&state.sys, state.sys_pid, gpu_util_pct);
     state.sys_last_update = Instant::now();
 }
@@ -971,6 +973,38 @@ fn read_coreml_gpu_util_pct() -> Option<f32> {
     parse_powermetrics_gpu_util(&stdout)
 }
 
+fn start_gpu_poll_thread() -> (Arc<Mutex<Option<f32>>>, Arc<AtomicBool>, JoinHandle<()>) {
+    let shared = Arc::new(Mutex::new(None));
+    let stop = Arc::new(AtomicBool::new(false));
+    let shared_thread = Arc::clone(&shared);
+    let stop_thread = Arc::clone(&stop);
+    let join = thread::spawn(move || {
+        while !stop_thread.load(Ordering::Relaxed) {
+            let val = read_coreml_gpu_util_pct();
+            if let Ok(mut guard) = shared_thread.lock() {
+                *guard = val;
+            }
+            for _ in 0..10 {
+                if stop_thread.load(Ordering::Relaxed) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+    });
+    (shared, stop, join)
+}
+
+fn stop_gpu_poller(state: &mut SourceState) {
+    if let Some(stop) = state.gpu_poll_stop.take() {
+        stop.store(true, Ordering::Relaxed);
+    }
+    if let Some(join) = state.gpu_poll_join.take() {
+        let _ = join.join();
+    }
+    state.gpu_util_shared = None;
+}
+
 fn parse_powermetrics_gpu_util(text: &str) -> Option<f32> {
     for line in text.lines() {
         let lower = line.to_lowercase();
@@ -1075,6 +1109,9 @@ struct SourceState {
     sys_pid: Option<sysinfo::Pid>,
     sys_last_update: Instant,
     sys_snapshot: SysSnapshot,
+    gpu_util_shared: Option<Arc<Mutex<Option<f32>>>>,
+    gpu_poll_stop: Option<Arc<AtomicBool>>,
+    gpu_poll_join: Option<JoinHandle<()>>,
     fps_last_update: Instant,
     fps_frames: usize,
     fps_value: f32,
@@ -1194,11 +1231,14 @@ let h = cap.get(videoio::CAP_PROP_FRAME_HEIGHT)? as i32;
             ProcessRefreshKind::nothing().with_cpu().with_memory(),
         );
     }
-    let gpu_util_pct = if cfg!(target_os = "macos") && matches!(device, Device::CoreMl) {
-        read_coreml_gpu_util_pct()
-    } else {
-        None
-    };
+    let (gpu_util_shared, gpu_poll_stop, gpu_poll_join, gpu_util_pct) =
+        if cfg!(target_os = "macos") && matches!(device, Device::CoreMl) {
+            let (shared, stop, join) = start_gpu_poll_thread();
+            let initial = shared.lock().ok().and_then(|v| *v);
+            (Some(shared), Some(stop), Some(join), initial)
+        } else {
+            (None, None, None, None)
+        };
     let sys_snapshot = build_sys_snapshot(&sys, sys_pid, gpu_util_pct);
 
     Ok((SourceState {
@@ -1220,6 +1260,9 @@ let h = cap.get(videoio::CAP_PROP_FRAME_HEIGHT)? as i32;
         sys_pid,
         sys_last_update: Instant::now(),
         sys_snapshot,
+        gpu_util_shared,
+        gpu_poll_stop,
+        gpu_poll_join,
         fps_last_update: Instant::now(),
         fps_frames: 0,
         fps_value: 0.0,
