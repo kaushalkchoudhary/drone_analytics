@@ -1,14 +1,20 @@
 use anyhow::{anyhow, Result};
 use crossbeam_channel::{bounded, Receiver};
+use chrono::Local;
+use jamtrack_rs::byte_tracker::ByteTracker;
 use ndarray::Array3;
 use opencv::{
-    core::{AlgorithmHint, Mat},
+    core::{AlgorithmHint, Mat, Size},
     imgproc,
-    prelude::{MatTraitConst, MatTraitConstManual, VideoCaptureTrait},
+    prelude::{
+        MatExprTraitConst, MatTraitConst, MatTraitConstManual, VideoCaptureTrait,
+        VideoCaptureTraitConst, VideoWriterTraitConst,
+    },
     videoio,
 };
 use serde::Deserialize;
 use std::{
+    collections::HashMap,
     env, fs,
     path::Path,
     str::FromStr,
@@ -17,8 +23,15 @@ use std::{
         Arc,
     },
     thread::{self, JoinHandle},
+    time::Instant,
 };
 use ultralytics_inference::Device;
+
+use crate::analytics::init_system_snapshot;
+use crate::mediamtx::start_rtsp_publisher;
+use crate::state::{
+    SourceState, RTSP_SAVE_SECONDS, TRACK_BUFFER, TRACK_THRESH, HIGH_THRESH, MATCH_THRESH,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub enum OutputFormat {
@@ -37,6 +50,9 @@ pub struct CliOptions {
     pub device: Option<Device>,
     pub threads: Option<usize>,
     pub io_buffer: usize,
+    pub show_heatmap: bool,
+    pub show_trails: bool,
+    pub show_bboxes: bool,
 }
 
 pub fn parse_args() -> Result<CliOptions> {
@@ -48,6 +64,9 @@ pub fn parse_args() -> Result<CliOptions> {
         device: None,
         threads: None,
         io_buffer: DEFAULT_IO_BUFFER,
+        show_heatmap: false,
+        show_trails: false,
+        show_bboxes: false,
     };
 
     let mut iter = env::args().skip(1).peekable();
@@ -93,6 +112,15 @@ pub fn parse_args() -> Result<CliOptions> {
                     Device::Cuda(0)
                 };
                 opts.device = Some(device);
+            }
+            "--heatmap" => {
+                opts.show_heatmap = true;
+            }
+            "--trails" => {
+                opts.show_trails = true;
+            }
+            "--bbox" | "--bboxes" => {
+                opts.show_bboxes = true;
             }
             _ if arg.starts_with("--") => {
                 let rest = arg.trim_start_matches("--");
@@ -231,4 +259,168 @@ pub fn source_display_name(source: &str) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or(base)
         .to_string()
+}
+
+pub fn init_source_state(
+    source: &str,
+    out_dir: &Path,
+    output: OutputFormat,
+    device: Device,
+) -> Result<(SourceState, videoio::VideoCapture)> {
+    unsafe {
+        if is_rtsp_source(source) {
+            std::env::set_var(
+                "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+                "rtsp_transport;tcp|fflags;discardcorrupt|err_detect;ignore_err",
+            );
+        } else {
+            std::env::set_var(
+                "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+                "fflags;discardcorrupt|err_detect;ignore_err",
+            );
+        }
+    }
+    let cap = videoio::VideoCapture::from_file(source, videoio::CAP_ANY)?;
+    if !cap.is_opened()? {
+        return Err(anyhow!("Could not open video"));
+    }
+
+    let fps = cap.get(videoio::CAP_PROP_FPS)?;
+    if fps <= 0.0 {
+        return Err(anyhow!("Invalid FPS"));
+    }
+
+    let w = cap.get(videoio::CAP_PROP_FRAME_WIDTH)? as i32;
+    let h = cap.get(videoio::CAP_PROP_FRAME_HEIGHT)? as i32;
+
+    let mediamtx = if is_rtsp_source(source) {
+        let publish_url = std::env::var("MEDIAMTX_PUBLISH_URL")
+            .unwrap_or_else(|_| "rtsp://127.0.0.1:8554/analytics".to_string());
+        Some(start_rtsp_publisher(w, h, fps, &publish_url)?)
+    } else {
+        None
+    };
+
+    let stride = 1usize;
+    let out_fps = fps;
+
+    let timestamp = Local::now().format("%Y%m%d_%H%M%S");
+    let (out_path, codecs, err_label) = match output {
+        OutputFormat::Mp4 => (
+            out_dir.join(format!("drone_analysis_{timestamp}.mp4")),
+            vec![
+                videoio::VideoWriter::fourcc('m', 'p', '4', 'v')?,
+                videoio::VideoWriter::fourcc('a', 'v', 'c', '1')?,
+                videoio::VideoWriter::fourcc('H', '2', '6', '4')?,
+                videoio::VideoWriter::fourcc('X', '2', '6', '4')?,
+            ],
+            "mp4",
+        ),
+        OutputFormat::Mkv => (
+            out_dir.join(format!("drone_analysis_{timestamp}.mkv")),
+            vec![
+                videoio::VideoWriter::fourcc('H', '2', '6', '4')?,
+                videoio::VideoWriter::fourcc('X', '2', '6', '4')?,
+                videoio::VideoWriter::fourcc('a', 'v', 'c', '1')?,
+                videoio::VideoWriter::fourcc('M', 'J', 'P', 'G')?,
+            ],
+            "mkv",
+        ),
+    };
+
+    let writer = {
+        let mut wtr = None;
+        for codec in codecs {
+            let candidate = videoio::VideoWriter::new(
+                out_path.to_str().unwrap(),
+                codec,
+                out_fps,
+                Size::new(w, h),
+                true,
+            )?;
+            if candidate.is_opened()? {
+                wtr = Some(candidate);
+                break;
+            }
+        }
+        wtr.ok_or_else(|| anyhow!("VideoWriter failed to open ({err_label})."))?
+    };
+
+    let write_limit = if is_rtsp_source(source) {
+        Some((out_fps * RTSP_SAVE_SECONDS).round().max(1.0) as usize)
+    } else {
+        None
+    };
+
+    let tracker = ByteTracker::new(
+        out_fps.round().max(1.0) as usize,
+        TRACK_BUFFER,
+        TRACK_THRESH,
+        HIGH_THRESH,
+        MATCH_THRESH,
+    );
+
+    let (sys, sys_pid, sys_last_update, sys_snapshot, gpu_util_shared, gpu_poll_stop, gpu_poll_join) =
+        init_system_snapshot(&device);
+
+    Ok((
+        SourceState {
+            fps,
+            w,
+            h,
+            stride,
+            out_fps,
+            writer,
+            writer_active: true,
+            write_limit,
+            frames_written: 0,
+            tracker,
+            tracks: HashMap::new(),
+            next_local_id: -1,
+            heatmap: Mat::zeros(h, w, opencv::core::CV_32F)?.to_mat()?,
+            source_label: source_display_name(source),
+            sys,
+            sys_pid,
+            sys_last_update,
+            sys_snapshot,
+            gpu_util_shared,
+            gpu_poll_stop,
+            gpu_poll_join,
+            fps_last_update: Instant::now(),
+            fps_frames: 0,
+            fps_value: 0.0,
+            traffic_density_ema: 0.0,
+            mobility_index_ema: 0.0,
+            mediamtx,
+            device,
+        },
+        cap,
+    ))
+}
+
+pub fn draw_source_label(frame: &mut Mat, label: &str) -> Result<()> {
+    let title = if label.is_empty() { "source" } else { label };
+    let scale = 0.7;
+    let thickness = 2;
+    imgproc::put_text(
+        frame,
+        title,
+        opencv::core::Point::new(30, 30),
+        imgproc::FONT_HERSHEY_DUPLEX,
+        scale,
+        opencv::core::Scalar::all(255.0),
+        thickness,
+        imgproc::LINE_AA,
+        false,
+    )?;
+    Ok(())
+}
+
+pub fn ema_update(prev: &mut f32, value: f32, alpha: f32) -> f32 {
+    if *prev == 0.0 {
+        *prev = value;
+    } else {
+        *prev = alpha * value + (1.0 - alpha) * *prev;
+    }
+    *prev
 }

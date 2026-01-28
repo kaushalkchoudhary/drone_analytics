@@ -126,14 +126,16 @@ pub fn decay_heatmap(h: &mut Mat) -> Result<()> {
     Ok(())
 }
 
-pub fn update_heatmap(h: &mut Mat, dets: &[Detection]) -> Result<()> {
-    for d in dets {
-        let (x, y) = bbox_bottom_center(d.bbox);
+pub fn update_heatmap(h: &mut Mat, tracks: &HashMap<i64, Track>) -> Result<()> {
+    for t in tracks.values() {
+        let Some(&(x, y)) = t.trail.last() else {
+            continue;
+        };
         imgproc::circle(
             h,
             Point::new(x as i32, y as i32),
             HEATMAP_RADIUS,
-            Scalar::all(2.0),
+            Scalar::all(3.0),
             -1,
             imgproc::LINE_AA,
             0,
@@ -156,7 +158,7 @@ pub fn overlay_heatmap(h: &Mat, frame: &mut Mat) -> Result<()> {
 
     let mut max_val = 0.0;
     core::min_max_loc(&blur, None, Some(&mut max_val), None, None, &core::no_array())?;
-    if max_val < 5.0 {
+    if max_val < 1.0 {
         return Ok(());
     }
 
